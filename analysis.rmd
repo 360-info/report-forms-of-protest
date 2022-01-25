@@ -1,0 +1,295 @@
+---
+title: "Gender and womens' protests"
+author: "James Goldie, 360info"
+---
+
+```{r setup}
+library(tidyverse)
+library(themes360info)
+library(ggforce)
+library(nVennR)
+library(here)
+```
+
+```{r load}
+
+news <- read_tsv(here("data", "worldprotests", "curator8.tsv"))
+
+# tidy the themes coding file
+read_csv(here("data", "worldprotests", "machine-readable.csv")) %>%
+  select(
+    id_num = INC_ID_,
+    id_country = CNT_NAM,
+    id_end_month = DAT_ENM,
+    id_end_year = DAT_ENY,
+    id_start_month = DAT_STM,
+    id_start_year = DAT_STY,
+    count_arrested =  REP_ARN,
+    count_dead = REP_DEN,
+    count_displaced = REP_DSN,
+    count_injured = REP_IJN,
+    count_missing = REP_MSN,
+    everything()) %>%
+  # give remaining columns a prefix
+  rename_with(~ paste0("theme_", .x), !starts_with(c("id_", "count_"))) %>%
+  # convert theme cols to logical
+  mutate(across(starts_with("theme_"), as.logical)) ->
+themes
+
+# map of column names to long names
+theme_dict <-
+  read_csv(here("data", "worldprotests", "categories.csv")) %>%
+  select(code, en)
+```
+
+Okay. Let's look at events that are coded as being related to themes "Women's/Girls' Rights" `RGT_WMN` or "Women/Girls/Feminist" `GRP_WGF`. What other themes emerge from them?
+
+```{r femevents}
+
+# we're going to filter on incidents where women and girls' rights themes
+# are observed, then lengthen out by theme to see what other themes are
+# present
+themes %>%
+  select(-ends_with("month"), -starts_with("count_")) %>%
+  filter(theme_RGT_WMN | theme_GRP_WGF) ->
+womens_themes_wide
+
+womens_themes_wide %>%
+  pivot_longer(starts_with("theme_"),
+    names_to = "theme", values_to = "present") %>%
+  filter(present) %>%
+  # now pull in the long theme names and order them by prevalence
+  mutate(
+    theme = str_replace_all(theme, "theme_", ""),
+    # now turn the theme into a factor to get the long labels
+    theme_long = factor(theme, levels = theme_dict$code, labels = theme_dict$en),
+    theme_long = fct_rev(fct_infreq(theme_long))) %>%
+  select(-present) ->
+womens_themes_long
+  
+# now calculate counts and proportions
+womens_themes_long %>%
+  group_by(theme, theme_long) %>%
+  summarise(
+    count = length(theme_long),
+    prop = count / nrow(womens_themes_wide)) %>%
+  ungroup() %>%
+  filter(!is.na(theme_long))  ->
+womens_themes_freq
+
+theme_freq_barplot <-
+  ggplot(womens_themes_freq) +
+  aes(x = theme_long, y = prop) +
+  geom_col(fill = "black") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::label_percent(), position = "right") +
+  labs(
+    x = NULL, y = "Proportion of articles",
+    title = toupper("Themes in protests"),
+    subtitle = toupper("Subtitle here"),
+    caption = "**Source:** worldprotests.org") +
+    theme_360(base_size = 14)
+
+save_360plot(theme_freq_barplot, here("out", "theme_freq_barplot.png"), shape = "phone-portrait")
+
+```
+
+Let's focus in on:
+
+MET_*: Type of Action
+GRV_*: Type of grievance
+GJU_*: ?
+OPP_*: Type of opponents
+EPL_*: ?
+REP_*: Repercussions (some are counts, or NA if unavilable)
+RGT_*: Rights demanded?
+SCP_*: Spatial scope
+REG_*: Region
+ICM_*: Income bracket (of whom? probably country income)
+
+Actors:
+  * GRP_WGF: Women/Girls/Feminist
+  * GRP_IND: Indigenous Group
+  * GRP_ERG: Ethnic/Racial Group
+
+Rights demanded:
+  * RGT_WMN: Women's/Girls' Rights
+  * RGT_GAY: LGBT/Sexual Rights 
+  * RGT_EIR: Ethnic/Indigenous/Racial Justice
+  * RGT_ENV: Environment and the Commons
+  * RGT_IMM: Immigrant Rights
+  * RGT_DEN: Deny Rights/Reject Equal Rights for a Group
+
+* Other aspects
+  * ACH_ENV: Environmental ?
+  * GJU_ENV: Environment/Climate Justice
+  * GJU_IMP: Anti-Imperialism
+
+
+Let's go back to the original dataset (all he events, not just the subsetted ones) and pick out the ones that include _any_ of the following themes.
+
+```{r test}
+themes %>%
+  select(-starts_with("count_")) %>%
+  # filter for only the events that have one of these themes
+  filter(if_any(
+    all_of(c("theme_GRP_WGF", "theme_GRP_IND", "theme_GRP_ERG",
+      "theme_RGT_WMN", "theme_RGT_GAY", "theme_RGT_EIR", "theme_RGT_ENV",
+      "theme_RGT_IMM", "theme_RGT_DEN")),
+    ~ .x)) ->
+event_subset
+```
+
+### Group associations
+
+Which groups turn up to certain kinds of events? Either (a) events that other groups have turned up to, or (b) events about something in particular?
+
+```{r assoc}
+
+# find_associations: tell me how often other themes featured in protests
+# with a basis theme?
+# - df: data farme of events
+# - basis: bare name of the column to subset to first
+# - category: string of category of themes to look for associations in (eg. "GRP")
+
+find_associations <- function(df, basis, category) {
+
+  df %>%
+    filter({{ basis }}) ->
+  df_filtered
+
+  # get max count first!
+  count_all <- nrow(df_filtered)
+    
+  df_filtered %>%
+    # calculate counts for the groups
+    summarise(across(
+      starts_with(paste0("theme_", category, "_")),
+      ~ length(which(.x)))) %>%
+    # lengthen and get theme descriptions
+    pivot_longer(
+      starts_with(paste0("theme_", category, "_")),
+      names_to = c("association"),
+      values_to = "count") %>%
+    mutate(association = str_replace(association, "theme_", "")) %>%
+    left_join(theme_dict, by = c("association" = "code")) %>%
+    filter(count > 0) %>%
+    # proportion calculated
+    mutate(prop = count / count_all)
+}
+
+event_subset %>% find_associations(theme_GRP_WGF, "GRP") -> womens_assoc
+event_subset %>% find_associations(theme_GRP_IND, "GRP") -> indig_assoc
+event_subset %>% find_associations(theme_GRP_ERG, "GRP") -> racial_assoc
+event_subset %>% find_associations(theme_RGT_GAY, "GRP") -> queer_assoc
+event_subset %>% find_associations(theme_GJU_ENV, "GRP") -> clim_assoc
+
+all_assoc <- bind_rows(
+  list(
+    "... with\nwomens'\ngroups?" = womens_assoc,
+    "... with\nindigenous\ngroups?" = indig_assoc,
+    "... with\nethnic and racial\ngroups?" = racial_assoc,
+    "... for\nqueer\nrights?" = queer_assoc,
+    "... for\nenvironment\nor climate\njustice?" = clim_assoc
+    ),
+  .id = "basis")
+
+# plot the associations
+all_assoc %>%
+  mutate(
+    en = str_replace(en, " ", "\n"),
+    # highlight = if_else(
+    #   group %in% c("GRP_IND", "GRP_ERG", "GRP_WGF"),
+    #   pal_360[["blue"]],
+    #   pal_360[["black"]])
+  ) %>%
+  {
+    ggplot(.) +
+      aes(x = en, y = count) +
+      geom_col() +
+      scale_fill_identity() +
+      coord_flip() +
+      facet_row(vars(basis)) +
+      theme_360(base_size = 12) +
+      theme(
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()
+      ) +
+      labs(
+        x = NULL, y = "Number of events",
+        title = toupper("Group associations"),
+        subtitle = toupper("Which groups appear at protests..."))
+  } %>%
+  print() %>%
+  save_360plot(here("out", "associations.png"), shape = "square")
+
+```
+
+### Actions
+
+Which kinds of protest method
+
+```{r opponents}
+event_subset %>% find_associations(theme_GRP_WGF, "MET") -> womens_met
+event_subset %>% find_associations(theme_GRP_ERG, "MET") -> racial_met
+event_subset %>% find_associations(theme_GJU_ENV, "MET") -> clim_met
+
+all_met <-
+  bind_rows(
+    list(
+      "... with **womens' groups?**" = womens_met,
+      # "... with indigenous groups?" = indig_met,
+      "... with **ethnic and racial groups?**" = racial_met,
+      # "... for queer rights?" = queer_met,
+      "... for **environment or climate justice?**" = clim_met
+      ),
+    .id = "basis") %>%
+  # add missing protest methods
+  complete(basis, en, fill = list(count = 0, prop = 0)) %>%
+  # remove violent methods since we're focusing on non-violent protest
+  filter(!(association %in% c("MET_VIO", "MET_VAL"))) %>%
+  # order b=ars by total frequency
+  mutate(en = fct_reorder(str_replace(en, " ", "\n"), count))
+
+# plot the opponents
+all_met %>%
+  {
+    ggplot(.) +
+      aes(x = en, y = count, fill = basis) +
+      geom_col(position = "dodge", width = 0.6) +
+      scale_y_continuous(expand = expansion(0, 0)) +
+      scale_fill_manual(
+        values = c(
+          pal_360[["green"]],
+          pal_360[["darkblue"]],
+          pal_360[["blue"]]),
+        guide = guide_legend(reverse = TRUE)) +
+      coord_flip() +
+      # facet_row(vars(basis)) +
+      theme_360(base_size = 16) +
+      theme(
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        # legend position and sizing
+        legend.position = "top",
+        legend.direction = "vertical",
+        legend.justification = "left",
+        legend.margin = margin(6, 6, 6, 0),
+        legend.key.width = unit(0.6, "cm"),
+        legend.key.height = unit(0.6, "cm"),
+        legend.text = element_textbox(
+          size = rel(1.1),
+          width = unit(13, "cm"))
+      ) +
+      labs(
+        x = NULL, y = "Number of events", fill = NULL,
+        title = toupper("Non-violent Protest methods"),
+        subtitle = toupper("Which non-violent methods are used at protests...")) +
+      labs(caption = paste(
+        "**CHART:** James Goldie, 360info",
+        "**DATA:** worldprotests.org",
+        sep = "<br>"))
+  } %>%
+  print() %>%
+  save_360plot(here("out", "methods.png"), shape = "phone-portrait")
+```
